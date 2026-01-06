@@ -1,0 +1,251 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Keypad.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_AHTX0.h>
+
+/* ======================= CHÂN PHẦN CỨNG ======================= */
+// LED + CÒI
+#define LED_PIN     4
+#define BUZZER_PIN  16
+
+// RUNG
+#define VIB_PIN     15
+
+// IR + ÁNH SÁNG
+#define DO_PIN      35
+#define IR_PIN      34
+
+// QUẠT
+#define FAN_IN1     17   // TX2
+#define FAN_IN2     2
+
+// TOUCH
+#define TOUCH1 5
+#define TOUCH2 18
+#define TOUCH3 19
+#define TOUCH4 21
+
+// I2C
+#define SDA_PIN 22
+#define SCL_PIN 23
+
+/* ======================= OLED ======================= */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/* ======================= KEYPAD ======================= */
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {26, 25, 33, 32};
+byte colPins[COLS] = {27, 14, 13, 12};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+/* ======================= AHT20 ======================= */
+Adafruit_AHTX0 aht;
+
+/* ======================= BIẾN HỆ THỐNG ======================= */
+// OLED
+char selectedProduct = 0;
+bool coVatCham = false;
+bool lastState = false;
+
+// RUNG
+int rungCount = 0;
+bool dangRung = false;
+unsigned long lastRungTime = 0;
+unsigned long firstRungTime = 0;
+const unsigned long debounceTime = 300;
+const unsigned long windowTime = 3000;
+
+/* ======================= OLED FUNCTIONS ======================= */
+void showHome() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("VENDING MACHINE");
+  display.println("----------------");
+  display.println("Chon SP: 1 2 3 4");
+  display.println("# = XAC NHAN");
+  display.println("* = HUY");
+  display.display();
+}
+
+void showStatus() {
+  display.fillRect(0, 30, SCREEN_WIDTH, 34, SSD1306_BLACK);
+  display.setCursor(0,30);
+  display.print("SP ");
+  display.println(selectedProduct);
+  if (coVatCham) display.println("CO SAN PHAM");
+  else display.println("DANG TRONG");
+  display.display();
+}
+
+void showQR() {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("THANH TOAN");
+  display.println("----------------");
+  display.print("SP: ");
+  display.println(selectedProduct);
+
+  int startX = 40, startY = 20, blockSize = 4;
+  randomSeed(analogRead(0));
+
+  for (int y=0;y<8;y++)
+    for (int x=0;x<8;x++)
+      display.fillRect(startX+x*blockSize,startY+y*blockSize,
+                       blockSize,blockSize,
+                       random(0,2)?SSD1306_BLACK:SSD1306_WHITE);
+
+  display.display();
+}
+
+bool readTouch(char sp) {
+  if (sp=='1') return digitalRead(TOUCH1);
+  if (sp=='2') return digitalRead(TOUCH2);
+  if (sp=='3') return digitalRead(TOUCH3);
+  if (sp=='4') return digitalRead(TOUCH4);
+  return false;
+}
+
+/* ======================= TASK 1: NHIỆT ĐỘ + QUẠT + ĐÈN ======================= */
+void taskNhietDo(void *pv) {
+  while (1) {
+    sensors_event_t h, t;
+    aht.getEvent(&h, &t);
+
+    if (t.temperature > 24.0) {
+      digitalWrite(LED_PIN, HIGH);
+      digitalWrite(FAN_IN1, HIGH);
+      digitalWrite(FAN_IN2, LOW);
+    } else {
+      digitalWrite(LED_PIN, LOW);
+      digitalWrite(FAN_IN1, LOW);
+      digitalWrite(FAN_IN2, LOW);
+    }
+
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
+}
+
+/* ======================= TASK 2: RUNG + CÒI ======================= */
+void canhBao() {
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    digitalWrite(BUZZER_PIN, LOW);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+  digitalWrite(LED_PIN, LOW);
+}
+
+void taskRung(void *pv) {
+  while (1) {
+    int vib = digitalRead(VIB_PIN);
+    unsigned long now = millis();
+
+    if (vib && !dangRung && now-lastRungTime>debounceTime) {
+      if (rungCount==0) firstRungTime=now;
+      rungCount++;
+      dangRung=true;
+      lastRungTime=now;
+    }
+    if (!vib) dangRung=false;
+    if (rungCount>0 && now-firstRungTime>windowTime) rungCount=0;
+    if (rungCount>=3) { canhBao(); rungCount=0; }
+
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+/* ======================= TASK 3: IR + ÁNH SÁNG ======================= */
+void taskIRLight(void *pv) {
+  while (1) {
+    if (digitalRead(DO_PIN)==LOW)
+      digitalWrite(LED_PIN, LOW);
+    else
+      digitalWrite(LED_PIN, digitalRead(IR_PIN)==LOW);
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+/* ======================= TASK 4: OLED + KEYPAD ======================= */
+void taskOLED(void *pv) {
+  while (1) {
+    char key = keypad.getKey();
+
+    if (key>='1' && key<='4') {
+      selectedProduct=key;
+      coVatCham=readTouch(key);
+      lastState=coVatCham;
+      showStatus();
+    }
+    else if (key=='#' && selectedProduct && coVatCham) {
+      showQR();
+      vTaskDelay(3000 / portTICK_PERIOD_MS);
+      showHome();
+      selectedProduct=0;
+    }
+    else if (key=='*') {
+      selectedProduct=0;
+      showHome();
+    }
+
+    if (selectedProduct) {
+      bool cur=readTouch(selectedProduct);
+      if (cur!=lastState) {
+        coVatCham=cur;
+        lastState=cur;
+        showStatus();
+      }
+    }
+
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
+/* ======================= SETUP ======================= */
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(VIB_PIN, INPUT);
+  pinMode(DO_PIN, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(FAN_IN1, OUTPUT);
+  pinMode(FAN_IN2, OUTPUT);
+
+  pinMode(TOUCH1, INPUT);
+  pinMode(TOUCH2, INPUT);
+  pinMode(TOUCH3, INPUT);
+  pinMode(TOUCH4, INPUT);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  showHome();
+  aht.begin();
+
+  xTaskCreate(taskNhietDo,"Temp",4096,NULL,1,NULL);
+  xTaskCreate(taskRung,"Vib",4096,NULL,1,NULL);
+  xTaskCreate(taskIRLight,"IR",2048,NULL,1,NULL);
+  xTaskCreate(taskOLED,"OLED",4096,NULL,1,NULL);
+}
+
+
