@@ -1,33 +1,35 @@
+/* ======================= BLYNK ======================= */
+#define BLYNK_TEMPLATE_ID "TMPL6GiZTk8C4"
+#define BLYNK_TEMPLATE_NAME "IOT"
+#define BLYNK_AUTH_TOKEN "Evxw_G2xM_o3NS5j1Zp8T-CHTGe7siM1"
+
+char ssid[] = "Nghệ An";
+char pass[] = "88888888";
+
+/* ======================= LIB ======================= */
 #include <Arduino.h>
 #include <Wire.h>
 #include <Keypad.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_AHTX0.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
 
 /* ======================= CHÂN PHẦN CỨNG ======================= */
-// LED + CÒI
 #define LED_PIN     4
 #define BUZZER_PIN  16
-
-// RUNG
 #define VIB_PIN     15
-
-// IR + ÁNH SÁNG
 #define DO_PIN      35
 #define IR_PIN      34
-
-// QUẠT
-#define FAN_IN1     17   // TX2
+#define FAN_IN1     17
 #define FAN_IN2     2
 
-// TOUCH
 #define TOUCH1 5
 #define TOUCH2 18
 #define TOUCH3 19
 #define TOUCH4 21
 
-// I2C
 #define SDA_PIN 22
 #define SCL_PIN 23
 
@@ -55,19 +57,26 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 /* ======================= AHT20 ======================= */
 Adafruit_AHTX0 aht;
 
-/* ======================= BIẾN HỆ THỐNG ======================= */
-// OLED
-char selectedProduct = 0;
-bool coVatCham = false;
-bool lastState = false;
+/* ======================= BIẾN CHUNG ======================= */
+float nhietDo = 0;
+bool canhBaoRung = false;
 
-// RUNG
-int rungCount = 0;
+/* 👉 GIỮ CẢNH BÁO CHO BLYNK */
+unsigned long timeCanhBao = 0;
+const unsigned long canhBaoHoldTime = 5000;
+
+/* ======================= BIẾN RUNG ======================= */
 bool dangRung = false;
+int rungCount = 0;
 unsigned long lastRungTime = 0;
 unsigned long firstRungTime = 0;
 const unsigned long debounceTime = 300;
-const unsigned long windowTime = 3000;
+const unsigned long windowTime   = 3000;
+
+/* ======================= BIẾN OLED ======================= */
+char selectedProduct = 0;
+bool coVatCham = false;
+bool lastState = false;
 
 /* ======================= OLED FUNCTIONS ======================= */
 void showHome() {
@@ -84,32 +93,37 @@ void showHome() {
 }
 
 void showStatus() {
-  display.fillRect(0, 30, SCREEN_WIDTH, 34, SSD1306_BLACK);
+  display.fillRect(0,30,SCREEN_WIDTH,34,SSD1306_BLACK);
   display.setCursor(0,30);
   display.print("SP ");
   display.println(selectedProduct);
-  if (coVatCham) display.println("CO SAN PHAM");
-  else display.println("DANG TRONG");
+  display.println(coVatCham ? "CO SAN PHAM" : "DANG TRONG");
   display.display();
 }
 
+/* ===== HIỂN THỊ QR GIẢ ===== */
 void showQR() {
   display.clearDisplay();
+  display.setTextSize(1);
   display.setCursor(0,0);
   display.println("THANH TOAN");
   display.println("----------------");
   display.print("SP: ");
   display.println(selectedProduct);
 
-  int startX = 40, startY = 20, blockSize = 4;
-  randomSeed(analogRead(0));
+  int startX = 40;
+  int startY = 20;
+  int blockSize = 4;
 
-  for (int y=0;y<8;y++)
-    for (int x=0;x<8;x++)
-      display.fillRect(startX+x*blockSize,startY+y*blockSize,
-                       blockSize,blockSize,
-                       random(0,2)?SSD1306_BLACK:SSD1306_WHITE);
+  randomSeed(millis());
 
+  for (int y = 0; y < 8; y++) {
+    for (int x = 0; x < 8; x++) {
+      if (random(0,2))
+        display.fillRect(startX + x*blockSize, startY + y*blockSize,
+                         blockSize, blockSize, SSD1306_WHITE);
+    }
+  }
   display.display();
 }
 
@@ -121,13 +135,14 @@ bool readTouch(char sp) {
   return false;
 }
 
-/* ======================= TASK 1: NHIỆT ĐỘ + QUẠT + ĐÈN ======================= */
+/* ======================= TASK NHIỆT ĐỘ ======================= */
 void taskNhietDo(void *pv) {
   while (1) {
     sensors_event_t h, t;
     aht.getEvent(&h, &t);
+    nhietDo = t.temperature;
 
-    if (t.temperature > 24.0) {
+    if (nhietDo > 28) {
       digitalWrite(LED_PIN, HIGH);
       digitalWrite(FAN_IN1, HIGH);
       digitalWrite(FAN_IN2, LOW);
@@ -136,87 +151,86 @@ void taskNhietDo(void *pv) {
       digitalWrite(FAN_IN1, LOW);
       digitalWrite(FAN_IN2, LOW);
     }
-
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
   }
 }
 
-/* ======================= TASK 2: RUNG + CÒI ======================= */
-void canhBao() {
-  unsigned long start = millis();
-  while (millis() - start < 5000) {
-    digitalWrite(LED_PIN, HIGH);
-    digitalWrite(BUZZER_PIN, HIGH);
-    vTaskDelay(200 / portTICK_PERIOD_MS);
-    digitalWrite(BUZZER_PIN, LOW);
-    vTaskDelay(200 / portTICK_PERIOD_MS);
-  }
-  digitalWrite(LED_PIN, LOW);
-}
-
+/* ======================= TASK RUNG (FIX BLYNK) ======================= */
 void taskRung(void *pv) {
   while (1) {
-    int vib = digitalRead(VIB_PIN);
+    int vibState = digitalRead(VIB_PIN);
     unsigned long now = millis();
 
-    if (vib && !dangRung && now-lastRungTime>debounceTime) {
-      if (rungCount==0) firstRungTime=now;
+    if (vibState == HIGH && !dangRung && (now - lastRungTime > debounceTime)) {
+      if (rungCount == 0) firstRungTime = now;
       rungCount++;
-      dangRung=true;
-      lastRungTime=now;
+      dangRung = true;
+      lastRungTime = now;
     }
-    if (!vib) dangRung=false;
-    if (rungCount>0 && now-firstRungTime>windowTime) rungCount=0;
-    if (rungCount>=3) { canhBao(); rungCount=0; }
 
-    vTaskDelay(20 / portTICK_PERIOD_MS);
+    if (vibState == LOW) dangRung = false;
+
+    if (rungCount > 0 && (now - firstRungTime > windowTime)) {
+      rungCount = 0;
+    }
+
+    if (rungCount >= 3) {
+      canhBaoRung = true;
+      timeCanhBao = millis();
+      rungCount = 0;
+    }
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
-/* ======================= TASK 3: IR + ÁNH SÁNG ======================= */
+/* ======================= TASK IR + ÁNH SÁNG ======================= */
 void taskIRLight(void *pv) {
   while (1) {
-    if (digitalRead(DO_PIN)==LOW)
-      digitalWrite(LED_PIN, LOW);
-    else
-      digitalWrite(LED_PIN, digitalRead(IR_PIN)==LOW);
-
+    if (digitalRead(DO_PIN)==HIGH && digitalRead(IR_PIN)==LOW) {
+      digitalWrite(LED_PIN, HIGH);
+    }
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
-/* ======================= TASK 4: OLED + KEYPAD ======================= */
+/* ======================= TASK OLED + KEYPAD ======================= */
 void taskOLED(void *pv) {
   while (1) {
     char key = keypad.getKey();
 
     if (key>='1' && key<='4') {
-      selectedProduct=key;
-      coVatCham=readTouch(key);
-      lastState=coVatCham;
+      selectedProduct = key;
+      coVatCham = readTouch(key);
+      lastState = coVatCham;
       showStatus();
     }
-    else if (key=='#' && selectedProduct && coVatCham) {
-      showQR();
-      vTaskDelay(3000 / portTICK_PERIOD_MS);
-      showHome();
-      selectedProduct=0;
+
+    if (key=='#') {
+      if (selectedProduct && coVatCham) {
+        showQR();
+        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        showHome();
+      }
+      selectedProduct = 0;
+      coVatCham = false;
     }
-    else if (key=='*') {
-      selectedProduct=0;
+
+    if (key=='*') {
+      selectedProduct = 0;
+      coVatCham = false;
       showHome();
     }
 
     if (selectedProduct) {
-      bool cur=readTouch(selectedProduct);
-      if (cur!=lastState) {
-        coVatCham=cur;
-        lastState=cur;
+      bool cur = readTouch(selectedProduct);
+      if (cur != lastState) {
+        coVatCham = cur;
+        lastState = cur;
         showStatus();
       }
     }
 
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
@@ -240,12 +254,41 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   showHome();
-  aht.begin();
 
-  xTaskCreate(taskNhietDo,"Temp",4096,NULL,1,NULL);
-  xTaskCreate(taskRung,"Vib",4096,NULL,1,NULL);
-  xTaskCreate(taskIRLight,"IR",2048,NULL,1,NULL);
-  xTaskCreate(taskOLED,"OLED",4096,NULL,1,NULL);
+  aht.begin();
+  WiFi.begin(ssid, pass);
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  xTaskCreatePinnedToCore(taskNhietDo, "Temp", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskRung, "Vib", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskIRLight, "IR", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskOLED, "OLED", 4096, NULL, 1, NULL, 1);
 }
 
+/* ======================= LOOP ======================= */
+void loop() {
+  Blynk.run();
 
+  static unsigned long lastSend = 0;
+  if (millis() - lastSend > 1000) {
+    Blynk.virtualWrite(V0, nhietDo);
+    Blynk.virtualWrite(V1, canhBaoRung ? "CANH BAO" : "BINH THUONG");
+    Blynk.virtualWrite(V2, digitalRead(TOUCH1)?"CO":"KHONG");
+    Blynk.virtualWrite(V3, digitalRead(TOUCH2)?"CO":"KHONG");
+    Blynk.virtualWrite(V4, digitalRead(TOUCH3)?"CO":"KHONG");
+    Blynk.virtualWrite(V5, digitalRead(TOUCH4)?"CO":"KHONG");
+    Blynk.virtualWrite(V6, digitalRead(IR_PIN)==LOW?"CO VAT":"KHONG");
+    Blynk.virtualWrite(V7, digitalRead(DO_PIN)==LOW?"SANG":"TOI");
+    lastSend = millis();
+  }
+
+  if (canhBaoRung) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(200);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    if (millis() - timeCanhBao > canhBaoHoldTime) {
+      canhBaoRung = false;
+    }
+  }
+}
